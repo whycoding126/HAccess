@@ -8,8 +8,8 @@
 
 #import "HNetworkDAO.h"
 #import "HDeserializableObject.h"
-#import <HFileCache.h>
-#import <HCommon.h>
+#import <HCache/HFileCache.h>
+#import <Hodor/HCommon.h>
 
 /**
  *  property desc
@@ -58,31 +58,10 @@
 }
 @end
 
-@implementation HNetworkMultiDataObj
-
-- (id)init
-{
-    self = [super init];
-    if(self)
-    {
-        self.filePath = nil;
-        self.fileName = @"file.jpg";
-        self.mimeType = @"image/jpg";
-        self.data = nil;
-        self.datas = nil;
-    }
-    return self;
-}
-
-@end
-
-
 @interface HNetworkDAO()
-{
-    NSOperation* _operation;
-    HNetworkDAO* _holdSelf;
-}
+@property (nonatomic) HNetworkDAO* holdSelf;
 @property (nonatomic) NSString *fileDownloadPath;
+@property (nonatomic) id<HNetworkProvider> provider;
 @end
 
 @implementation HNetworkDAO
@@ -99,10 +78,14 @@
         _failedBlock = nil;
         _holdSelf = nil;
         self.method = @"GET";
+        self.timeoutInterval = 30;
     }
     return self;
 }
-
+- (void)dealloc
+{
+    [self cancel];
+}
 - (id<HNDeserializer>)deserializer
 {
     if (!_deserializer)
@@ -121,7 +104,10 @@
     if (self.pathURL) urlString =[[NSURL URLWithString:self.pathURL relativeToURL:baseUrl] absoluteString];
     return urlString;
 }
-
+- (void)willSendRequest:(NSMutableURLRequest *)request
+{
+    //do nothing
+}
 - (void)startWithQueueName:(NSString*)queueName
 {
     _queueName = queueName;
@@ -171,61 +157,83 @@
         //set http headers
         NSMutableDictionary *headers = [NSMutableDictionary new];
         [self setupHeader:headers];
-        //set params
-        NSMutableDictionary *params = [NSMutableDictionary new];
-        [self setupParams:params];
-        [self didSetupParams:params];
+        
+        id params = [self setupParams];
+        
         //request
         __weak HNetworkDAO* weakSelf = self;
         _holdSelf = self;
-        dispatch_async(dispatch_get_main_queue(), ^{
+        dispatch_async(dispatch_get_global_queue(0, 0), ^{
             
-            [HNetworkDAOManager instance].timeoutInterval = self.timeoutInterval;
-            [HNetworkDAOManager instance].shouldContinueInBack = self.shouldContinueInBack;
-            [HNetworkDAOManager instance].fileDownloadPath = self.fileDownloadPath;
-            [HNetworkDAOManager instance].headParameters = headers;
-            _operation = [[HNetworkDAOManager instance]
-                          requestWithURLString:urlString
-                          parameters:params
-                          queueName:queueName
-                          mode:self.method
-                          sucess:^(AFHTTPRequestOperation* operation, id responseObject){
-                              
-                              NSLog(@" ");
-                              NSLog(@"#### revc response");
-                              NSLog(@"#### %@", [weakSelf fullurl]);
-                              NSLog(@" ");
-                              if (!weakSelf.fileDownloadPath)
-                              {
-                                  weakSelf.responseData = operation.responseData;
-                                  [weakSelf requestFinishedSucessWithInfo:responseObject];
-                              }
-                              else
-                              {
-                                  HDownloadFileInfo *info = [HDownloadFileInfo new];
-                                  info.filePath = weakSelf.fileDownloadPath;
-                                  info.MIMEType = [operation.response MIMEType];
-                                  info.length = [operation.response expectedContentLength];
-                                  info.suggestedFilename = [operation.response suggestedFilename];
-                                  //delete after 1 min
-                                  [[HFileCache shareCache] setExpire:[NSDate dateWithTimeIntervalSinceNow:60] forFilePath:info.filePath];
-                                  [weakSelf downloadFinished:info];
-                              }
-                              
-                              
-                          }
-                          failure:^(AFHTTPRequestOperation* operation, NSError* error){
-                              
-                              [weakSelf requestFinishedFailureWithError:[NSError errorWithDomain:@"Network" code:error.code description:error.localizedDescription]];
-                              
-                              
-                          }
-                          progressBlock:weakSelf.progressBlock
-                          ];
+            NSString *className = [HClassManager getClassNameForKey:HNetworkProviderRegKey];
+            Class class = NSClassFromString(className);
+            
+            if (!class)
+            {
+                [self requestFinishedFailureWithError:herr(kInnerErrorCode, @"can't find any Class for HNetworkProviderRegKey")];
+                return;
+            }
+            
+            self.provider = [class new];
+            if (![self.provider conformsToProtocol:@protocol(HNetworkProvider)])
+            {
+                [self requestFinishedFailureWithError:herr(kInnerErrorCode, ([NSString stringWithFormat:@"%@ is not a HNetworkProvider", className]))];
+                return;
+            }
+
+            [self.provider setUrlString:urlString];
+            [self.provider setParams:params];
+            [self.provider setMethod:self.method];
+            [self.provider setQueueName:queueName];
+            
+            [self.provider setTimeoutInterval:self.timeoutInterval];
+            [self.provider setShouldContinueInBack:self.shouldContinueInBack];
+            [self.provider setFileDownloadPath:self.fileDownloadPath];
+            [self.provider setHeadParameters:headers];
+            if ([self.cacheType isKindOfClass:[HNSystemCacheStrategy class]])
+            {
+                [self.provider setCachePolicy:[(HNSystemCacheStrategy *)self.cacheType policy]];
+            }
+            [self.provider setSuccessCallback:^(id sender, NSHTTPURLResponse *response, NSData *data){
+
+                NSLog(@"#### revc response:\n%@", [weakSelf fullurl]);
+                
+                if (!weakSelf.fileDownloadPath)
+                {
+                    weakSelf.responseData = data;
+                    [weakSelf requestFinishedSucessWithInfo:data response:response];
+                }
+                else
+                {
+                    HDownloadFileInfo *info = [HDownloadFileInfo new];
+                    info.filePath = weakSelf.fileDownloadPath;
+                    info.MIMEType = [response MIMEType];
+                    info.length = [response expectedContentLength];
+                    info.suggestedFilename = [response suggestedFilename];
+                    //delete after 1 min
+                    [[HFileCache shareCache] setExpire:[NSDate dateWithTimeIntervalSinceNow:60] forFilePath:info.filePath];
+                    [weakSelf downloadFinished:info];
+                }
+            }];
+            
+            [self.provider setFailCallback:^(id sender, NSError *error){
+                [weakSelf requestFinishedFailureWithError:[NSError errorWithDomain:@"Network" code:error.code description:error.localizedDescription]];
+            }];
+            
+            [self.provider setProgressCallback:self.progressBlock];
+            
+            [self.provider setWillSendCallback:^(NSMutableURLRequest *request){
+                [weakSelf willSendRequest:request];
+            }];
+            
+            [self.provider sendRequest];
         });
     }
 }
-
+- (void)start:(void(^)(id sender, id data))sucess failure:(void(^)(id sender, NSError *error))failure
+{
+    [self startWithQueueName:nil sucess:sucess failure:failure];
+}
 - (void)startWithQueueName:(NSString *)queueName
                     sucess:(void (^)(id, id))sucess
                    failure:(void (^)(id, NSError *))failure
@@ -234,6 +242,10 @@
     _failedBlock = failure;
     [self cacheLogic:queueName];
 
+}
+- (void)start:(void(^)(id sender, id data, NSError *error))finish
+{
+    [self startWithQueueName:nil finish:finish];
 }
 - (void)startWithQueueName:(NSString *)queueName
                     finish:(void(^)(id sender, id data, NSError *error))finish
@@ -249,7 +261,7 @@
 
 - (void)cancel
 {
-    [_operation cancel];
+    [self.provider cancel];
 }
 
 - (void)setupHeader:(NSMutableDictionary *)headers
@@ -264,6 +276,14 @@
             [headers setValue:[self valueForKey:key] forKey:extsObj.keyMapto?:key];
         }
     }
+}
+- (id)setupParams
+{
+    //set params
+    NSMutableDictionary *params = [NSMutableDictionary new];
+    [self setupParams:params];
+    [self didSetupParams:params];
+    return params;
 }
 - (void)setupParams:(NSMutableDictionary *)params
 {
@@ -292,20 +312,22 @@
 {
 
 }
-- (id)processData:(id)responseInfo
+- (id)processData:(NSData *)responseInfo
 {
     [self.deserializer setDeserializeKeyPath:self.deserializeKeyPath];
+
+    id processRes = responseInfo;
     if ([self.deserializer respondsToSelector:@selector(preprocess:)])
     {
-        responseInfo = [self.deserializer preprocess:responseInfo];
-        if ([responseInfo isKindOfClass:[NSError class]])
+        processRes = [self.deserializer preprocess:responseInfo];
+        if ([processRes isKindOfClass:[NSError class]])
         {
-            NSAssert(NO, [responseInfo description]);
-            [self requestFinishedFailureWithError:responseInfo];
+            [self requestFinishedFailureWithError:processRes];
+            return nil;
         }
     }
     
-    id responseEntity = [self getOutputEntiy:responseInfo];
+    id responseEntity = [self getOutputEntiy:processRes];
     if (!responseEntity)
     {
         NSString *errorStr = [NSString stringWithFormat:@"inner error:%@.getOutputEntiy return nil", NSStringFromClass(self.class)];
@@ -333,18 +355,14 @@
         NSData *fileData = [NSData dataWithContentsOfURL:[NSURL URLWithString:urlString]];
         if (!fileData)
         {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self requestFinishedFailureWithError:[NSError errorWithDomain:@"Network" code:kNetWorkErrorCode description:[NSString stringWithFormat:@"%@ file not exsit", urlString]]];
-            });
+            [self requestFinishedFailureWithError:[NSError errorWithDomain:@"Network" code:kNetWorkErrorCode description:[NSString stringWithFormat:@"%@ file not exsit", urlString]]];
             return ;
         }
         if (!self.isFileDownload)
         {
-            NSLog(@"revc response %@/%@", self.baseURL, self.pathURL);
+            NSLog(@"\n\n#### revc response \n%@", [self fullurl]);
             self.responseData = fileData;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self requestFinishedSucessWithInfo:fileData];
-            });
+            [self requestFinishedSucessWithInfo:fileData response:nil];
         }
         else
         {
@@ -358,9 +376,7 @@
             //设置为1小时后删除
             [[HFileCache shareCache] setExpire:[NSDate dateWithTimeIntervalSinceNow:3600] forFilePath:info.filePath];
             
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self downloadFinished:info];
-            });
+            [self downloadFinished:info];
         }
     });
 }
@@ -371,21 +387,31 @@
 {
     NSString *urlString = @"HNetworkDAO.bundle";
     NSBundle *mockFileBundle = [NSBundle bundleWithPath:[[NSBundle mainBundle] pathForResource:@"HNetworkDAO" ofType:@"bundle"]];
+
+    if (self.mockBundlePath)
+    {
+        mockFileBundle = [NSBundle bundleWithURL:[NSURL URLWithString:self.mockBundlePath]];
+    }
+
     if (mockFileBundle)
     {
         NSString *fileType = nil;
         if ([self.deserializer respondsToSelector:@selector(mockFileType)]) fileType = [self.deserializer mockFileType];
             
         urlString = [mockFileBundle pathForResource:NSStringFromClass([self class]) ofType:fileType];
-        urlString = [NSURL fileURLWithPath:urlString].absoluteString;
-        [self doLocalFileRequest:urlString];
+        if (urlString)
+        {
+            urlString = [NSURL fileURLWithPath:urlString].absoluteString;
+            [self doLocalFileRequest:urlString];
+            return;
+        }
+        else
+        {
+            urlString = [NSString stringWithFormat:@"%@.%@",NSStringFromClass([self class]),fileType];
+        }
     }
-    else
-    {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self requestFinishedFailureWithError:[NSError errorWithDomain:@"Network" code:kNetWorkErrorCode description:[NSString stringWithFormat:@"%@ file not exsit", urlString]]];
-        });
-    }
+    
+    [self requestFinishedFailureWithError:[NSError errorWithDomain:@"Network" code:kInnerErrorCode description:[NSString stringWithFormat:@"%@ file not exsit", urlString]]];
 }
 #endif
 
@@ -395,158 +421,174 @@
 {
     return [NSString stringWithFormat:@"%@%@",self.baseURL, self.pathURL];
 }
-- (BOOL)isCacheUseable
-{
-    return [self isCacheUseable:[self cacheKey]];
-}
-- (BOOL)isCacheUseable:(NSString *)cacheKey
-{
-    BOOL cacheUsable = NO;
-    if (self.cacheDuration > 0)
-    {
-        NSString *cachePath = [[HFileCache shareCache] cachePathForKey:cacheKey];
-        if (cachePath)
-        {
-            NSDictionary *fileAttributes = [[NSFileManager defaultManager] attributesOfItemAtPath:cachePath error:nil];
-            if (fileAttributes)
-            {
-                NSDate *createDate = fileAttributes[NSFileCreationDate];
-                long interval = [[NSDate date] timeIntervalSinceDate:createDate];
-                if (interval < self.cacheDuration)
-                {
-                    cacheUsable = YES;
-                }
-            }
-        }
-    }
-    return cacheUsable;
-}
-//get cache
-- (void)loadCache:(NSString *)cacheKey
-{
-    id data = [[HFileCache shareCache] dataForKey:cacheKey];
-    if (data)
-    {
-        id responseEntity = [self processData:data];
-        if (!responseEntity) return; //has deal all exception
-        else if(_sucessBlock) _sucessBlock(nil, responseEntity);
-    }
-}
 
 - (void)cacheLogic:(NSString *)queueName
 {
-    NSString *cacheKey = [self cacheKey];
-    switch (self.cacheType) {
-        case HFileCacheTypeNone:
-        {
-            [self startWithQueueName:queueName];
-            break;
-        }
-        case HFileCacheTypeBoth:
-        {
-            if([self isCacheUseable:cacheKey])
+    if ([self.cacheType isKindOfClass:[HNCustomCacheStrategy class]])
+    {
+        HNCustomCacheStrategy *customCacheStrategy = self.cacheType;
+        customCacheStrategy.cacheKey = self.cacheKey;
+        __weak typeof(self) weakSelf = self;
+        [customCacheStrategy cacheLogic:^(BOOL shouldRequest, NSData *cachedData) {
+            if (cachedData)
             {
-                [self loadCache:cacheKey];
-                //解除保持
-                _failedBlock = nil;
-                _sucessBlock = nil;
-                _holdSelf = nil;
+                id responseEntity = [weakSelf processData:cachedData];
+                if (!responseEntity) return; //has deal all exception
+                else if(weakSelf.sucessBlock) weakSelf.sucessBlock(nil, responseEntity);
+            }
+            if (shouldRequest)
+            {
+                [weakSelf startWithQueueName:queueName];
             }
             else
             {
-                [self loadCache:cacheKey];
-                [self startWithQueueName:queueName];
+                weakSelf.failedBlock = nil;
+                weakSelf.sucessBlock = nil;
+                weakSelf.holdSelf = nil;
             }
-            break;
-        }
-        case HFileCacheTypeExclusive:
-        {
-            if (![self isCacheUseable:cacheKey])
-            {
-                [self startWithQueueName:queueName];
-            }
-            else
-            {
-                [self loadCache:cacheKey];
-                //解除保持
-                _failedBlock = nil;
-                _sucessBlock = nil;
-                _holdSelf = nil;
-            }
-            break;
-        }
-        case HFileCacheTypeForceRefresh:
-        {
-            [self startWithQueueName:queueName];
-            break;
-        }
-        default:
-            break;
+        }];
     }
+    else [self startWithQueueName:queueName];
+//    NSString *cacheKey = [self cacheKey];
+//    switch (self.cacheType) {
+//        case HFileCacheTypeNone:
+//        {
+//            [self startWithQueueName:queueName];
+//            break;
+//        }
+//        case HFileCacheTypeBoth:
+//        {
+//            [self loadCache:cacheKey];
+//            [self startWithQueueName:queueName];
+//            break;
+//        }
+//        case HFileCacheTypeExclusive:
+//        {
+//            if (![self isCacheUseable:cacheKey])
+//            {
+//                [self startWithQueueName:queueName];
+//            }
+//            else
+//            {
+//                [self loadCache:cacheKey];
+//                //解除保持
+//                _failedBlock = nil;
+//                _sucessBlock = nil;
+//                _holdSelf = nil;
+//            }
+//            break;
+//        }
+//        case HFileCacheTypeForceRefresh:
+//        {
+//            [self startWithQueueName:queueName];
+//            break;
+//        }
+//        default:
+//            break;
+//    }
 }
 
 #pragma mark - queue
 + (void)initQueueWithName:(NSString *)queueName maxMaxConcurrent:(NSInteger)maxMaxConcurrent
 {
-    [HNetworkDAOManager initQueueWithName:queueName maxMaxConcurrent:maxMaxConcurrent];
+    [HNQueueManager initQueueWithName:queueName maxMaxConcurrent:maxMaxConcurrent];
 }
 
 + (BOOL)cancelQueueWithName:(NSString*)queueName
 {
     if(queueName)
     {
-        [[HNetworkDAOManager instance] destoryOperationQueueWithName:queueName];
+        [[HNQueueManager instance] destoryOperationQueueWithName:queueName];
         return YES;
     }
     return NO;
 }
 #pragma mark - netWorking finished
 
-- (void)requestFinishedSucessWithInfo:(id)responInfo
+- (void)requestFinishedSucessWithInfo:(NSData *)responInfo response:(NSHTTPURLResponse *)response
 {
-    id responseEntity = [self processData:responInfo];
-    if (!responseEntity) return; //has deal all exception
-    //record
-    if (self.cacheType != HFileCacheTypeNone)
+
+
+    @weakify(self);
+    @weakify(response);
+    callback processDataCallabck = ^(id sender, id data)
     {
-        NSData *orignalData = self.responseData;
-        [[HFileCache shareCache] setData:orignalData forKey:[self cacheKey]
-                               expire:[NSDate dateWithTimeInterval:self.cacheDuration sinceDate:[NSDate date]]];
+        @strongify(self);
+        @strongify(response);
+
+        id responseEntity = [self processData:data];
+        if (!responseEntity)
+        {
+            return; //has deal all exception
+        }
+
+        if ([self.cacheType isKindOfClass:[HNCustomCacheStrategy class]])
+        {
+            HNCustomCacheStrategy *customCacheStrategy = self.cacheType;
+            [customCacheStrategy handleRespInfo:data];
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if(_sucessBlock)
+                _sucessBlock(self, responseEntity);
+
+            //clear
+            _failedBlock = nil;
+            _sucessBlock = nil;
+            _holdSelf = nil;
+        });
+    };
+
+    if (self.isAsynchParsingData)
+    {
+        dispatch_async(dispatch_get_global_queue(0, 0), ^{
+            processDataCallabck(self, response);
+        });
     }
-
-
-    if(_sucessBlock)
-        _sucessBlock(self, responseEntity);
-    
-    //clear
-    _failedBlock = nil;
-    _sucessBlock = nil;
-    _holdSelf = nil;
+    else
+    {
+        processDataCallabck(self, responInfo);
+    }
 }
+
+
 
 
 - (void)requestFinishedFailureWithError:(NSError*)error
 {
-    NSLog(@"error:%li,%@,%@ url = %@/%@", (long)error.code,error.domain,error.localizedDescription, self.baseURL, self.pathURL);
-    
-    if(_failedBlock)
-        _failedBlock(self,  error);
-    
-    //clear
-    _failedBlock = nil;
-    _sucessBlock = nil;
-    _holdSelf = nil;
+    NSLog(@"\n\n#### request error:\n%li,%@,%@ \n url = %@", (long)error.code,error.domain,error.localizedDescription, [self fullurl]);
+    if (self.responseData) NSLog(@"data:\n%@", [[NSString alloc] initWithData:self.responseData encoding:NSUTF8StringEncoding]);
+
+    if (error.code == kDataFormatErrorCode)
+    {
+#ifdef DEBUG
+        NSAssert(NO, error.localizedDescription);
+#else
+        NSAssert(NO, ([NSString stringWithFormat:@"request error:\n%li,%@,%@ \n url = %@ \n data:\n%@", (long)error.code,error.domain,error.localizedDescription, [self fullurl],  [[NSString alloc] initWithData:self.responseData encoding:NSUTF8StringEncoding]]));
+#endif
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if(_failedBlock)
+            _failedBlock(self,  error);
+        
+        //clear
+        _failedBlock = nil;
+        _sucessBlock = nil;
+        _holdSelf = nil;
+    });
 }
 
 - (void)downloadFinished:(HDownloadFileInfo *)info
 {
-    if(_sucessBlock)
-        _sucessBlock(self, info);
-    
-    //clear
-    _failedBlock = nil;
-    _sucessBlock = nil;
-    _holdSelf = nil;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if(_sucessBlock)
+            _sucessBlock(self, info);
+        
+        //clear
+        _failedBlock = nil;
+        _sucessBlock = nil;
+        _holdSelf = nil;
+    });
 }
 
 

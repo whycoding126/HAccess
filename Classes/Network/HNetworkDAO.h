@@ -7,47 +7,20 @@
 //
 
 #import <Foundation/Foundation.h>
-#import "HNetworkDAOManager.h"
-#import <NSObject+annotation.h>
+#import "HNQueueManager.h"
+#import <Hodor/NSObject+annotation.h>
+#import "HEntity.h"
 #import "HNDeserializer.h"
+#import "HNetworkProvider.h"
+#import "HNetworkMultiDataObj.h"
+#import "HNCacheStrategy.h"
+#import "HNSystemCacheStrategy.h"
+#import "HNCustomCacheStrategy.h"
 //in most situation, you use json Deserializer
 #import "HNJsonDeserializer.h"
 
-#pragma mark - file upload object，
-
-/**
- *  this is a file object ， use for file upload
- *  just use it as a param of any network dao
- */
-@interface HNetworkMultiDataObj : NSObject
-@property (nonatomic, strong) NSString* filePath;
-//default： file.jpg
-@property (nonatomic, strong) NSString* fileName;
-//default： image/jpg
-@property (nonatomic, strong) NSString* mimeType;
-//default：nil. if data is not null it will ignore filePath
-@property (nonatomic, strong) NSData* data;
-//default：nil. if datas is not null it will ignore filePath and data
-@property (nonatomic, strong) NSArray* datas;
-@end
-
-
-/**
- *  cache type
- *  it is not the same as NSURLRequestCachePolicy
- */
-typedef enum
-{
-    HFileCacheTypeNone = 0, //no cache, directly and no cache result
-    HFileCacheTypeBoth,     //if has cache read cache and callback then request and callback, this type will callback twice if has cache
-    HFileCacheTypeExclusive, //if has cache read cache and callback , if not request and callback
-    HFileCacheTypeForceRefresh //will not read cache, but will save cache after get requst
-} HFileCacheType;
-
 
 @class HNetworkDAO;
-
-
 typedef void(^HNetworkDAOFinishBlock)(HNetworkDAO* request, id resultInfo);
 
 
@@ -68,16 +41,10 @@ typedef void(^HNetworkDAOFinishBlock)(HNetworkDAO* request, id resultInfo);
  *          use 'cache type' with some special 'cacheDuration' will get more flexable
  */
 @interface HNetworkDAO : NSObject
-{
-    HNetworkDAOFinishBlock _sucessBlock;
-    HNetworkDAOFinishBlock _failedBlock;
-}
 //set URL , it support these prefix: 'http://', 'https://', 'file://', 'bundle://'
 @property (nonatomic, strong) NSString* baseURL;
 @property (nonatomic, strong) NSString* pathURL;
-#ifdef DEBUG
-@property (nonatomic) BOOL isMock;
-#endif
+
 //GET|POST default is GET
 @property (nonatomic, strong) NSString* method;
 //what is the queue name
@@ -99,12 +66,29 @@ typedef void(^HNetworkDAOFinishBlock)(HNetworkDAO* request, id resultInfo);
 //rude data, if the request is file download ,it will not work
 @property (nonatomic, strong) NSData *responseData;
 //cache type
-@property (nonatomic) HFileCacheType cacheType;
-//how long the cache lives, default is a week
-@property (nonatomic) long cacheDuration;
+@property (nonatomic) id<HNCacheStrategy> cacheType;
 //if it is file download request, set the to YES.
 @property (nonatomic) BOOL isFileDownload;
 
+//only use for subclass
+@property (nonatomic, strong) HNetworkDAOFinishBlock sucessBlock;
+@property (nonatomic, strong) HNetworkDAOFinishBlock failedBlock;
+
+// Whether asynchronous asynch Thead parsing Data
+@property (nonatomic) BOOL isAsynchParsingData;
+
+//mock request
+@property (nonatomic) BOOL isMock;
+//default bundle is HNetworkDAO.bundle
+@property (nonatomic, strong) NSString* mockBundlePath;
+
+/**
+ *  begin request
+ *
+ *  @param sucess  callback when request success
+ *  @param failure callback when request fail
+ */
+- (void)start:(void(^)(id sender, id data))sucess failure:(void(^)(id sender, NSError *error))failure;
 /**
  *  begin request
  *
@@ -117,6 +101,13 @@ typedef void(^HNetworkDAOFinishBlock)(HNetworkDAO* request, id resultInfo);
                     sucess:(void(^)(id sender, id data))sucess
                    failure:(void(^)(id sender, NSError *error))failure;
 
+
+
+/**
+ *  begin request
+ *  @param finish    callback when success or fail
+ */
+- (void)start:(void(^)(id sender, id data, NSError *error))finish;
 
 /**
  *  begin request
@@ -149,13 +140,6 @@ typedef void(^HNetworkDAOFinishBlock)(HNetworkDAO* request, id resultInfo);
  */
 + (BOOL)cancelQueueWithName:(NSString*)queueName;
 
-/**
- *  is my cache usable, if not exist or cache is too old return NO
- */
-- (BOOL)isCacheUseable;
-
-
-
 
 #pragma mark - extention
 
@@ -164,6 +148,16 @@ typedef void(^HNetworkDAOFinishBlock)(HNetworkDAO* request, id resultInfo);
  *  @param headers: empty NSMutableDictionary
  */
 - (void)setupHeader:(NSMutableDictionary *)headers;
+
+/**
+ *  config params
+ *  mostly you need not care about this function, except you want post something directly not like a=1&b=2
+ *  default behavior is construct a NSDictionary by properties
+ *  you can return a NSData in subClass, then the data will set into HttpBody directly
+ *
+ *  @return NSDictionary or NSData,
+ */
+- (id)setupParams;
 
 /**
  *  set request params, if method is 'GET', will append to url, if 'POST' will append to request body
@@ -180,18 +174,23 @@ typedef void(^HNetworkDAOFinishBlock)(HNetworkDAO* request, id resultInfo);
 - (void)didSetupParams:(NSMutableDictionary *)params;
 
 /**
+ *  will Send Request
+ *  you can do some log, encript progress there
+ *  @param request
+ */
+- (void)willSendRequest:(NSMutableURLRequest *)request;
+/**
  *  send request
  *
  *  @param queueName
  */
 - (void)startWithQueueName:(NSString*)queueName;
 
-
 /**
  *  after recv response, default operation is invoke getOutputEntiy and write cache
  *  u can do some status code examlation there
  */
-- (void)requestFinishedSucessWithInfo:(id)responInfo;
+- (void)requestFinishedSucessWithInfo:(NSData *)responInfo response:(NSHTTPURLResponse *)response;
 
 /**
  *  deal response data and convert to a object as new response, if return NSError, it will route to fail callback
